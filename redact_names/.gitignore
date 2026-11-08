@@ -1,0 +1,18 @@
+.build/
+*_redacted/
+*_redacted.*
+*_review_log.csv
+
+# samples/: only the synthetic generator and its fake-name output are committable.
+# Anything else (e.g. real student scans) is ignored.
+samples/*
+!samples/make_samples.swift
+!samples/quiz_png.png
+!samples/quiz_table.png
+!samples/quiz_twoline.png
+!samples/quiz_nocolon.png
+!samples/quiz_class.pdf
+!samples/quiz_class_infer.pdf
+!samples/quiz_jpg.jpg
+!samples/quiz_nolabel.png
+!samples/quiz_two_page.pdf
