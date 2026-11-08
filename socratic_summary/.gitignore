@@ -1,0 +1,3 @@
+# Outputs contain student-derived content (the data file and the summary's student key have names).
+*.data.json
+*_summary*.md
