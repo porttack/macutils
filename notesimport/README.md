@@ -40,12 +40,11 @@ The defaults were written for one person's Mac. Before you install, decide what 
 From this folder:
 
 ```
-swiftc summarize-pdf.swift -o "$TMPDIR/summarize-pdf"
 sudo mkdir -p /usr/local/bin
-sudo install -m 755 "$TMPDIR/summarize-pdf" /usr/local/bin/
+make install
 ```
 
-Building into `$TMPDIR` keeps the compiled binary out of the repository. The `mkdir` is needed on Macs where `/usr/local/bin` doesn't exist yet. It's already on the default PATH once it exists, and Homebrew on Apple silicon uses `/opt/homebrew`, so nothing else will overwrite the tool there. The build takes a few seconds.
+`make` builds `summarize-pdf` here (it's gitignored) and `make install` copies it to `/usr/local/bin` with `sudo`. The `mkdir` is needed on Macs where `/usr/local/bin` doesn't exist yet. It's already on the default PATH once it exists, and Homebrew on Apple silicon uses `/opt/homebrew`, so nothing else will overwrite the tool there. Set `PREFIX` to install elsewhere (`make install PREFIX=~/.local`, though the AppleScript expects `/usr/local/bin`). The build takes a few seconds.
 
 Check that it works:
 
@@ -158,13 +157,14 @@ These are `property` lines at the top of the script.
 ## How summarize-pdf works
 
 ```
-summarize-pdf [--dry-run] [--always-add-summary] file.pdf
+summarize-pdf [--dry-run] [--always-add-summary] [--no-cleanup] file.pdf
 ```
 
 | Option | Effect |
 |---|---|
 | `-n`, `--dry-run` | Downloads, OCRs, and summarizes, then reports what it would change without writing anything |
 | `-s`, `--always-add-summary` | Also stores the summary in PDFs that already have text (this rewrites the file, so its modification date changes) |
+| `-C`, `--no-cleanup` | Skips the black-and-white page cleanup (see below) |
 | `-h`, `--help` | Shows usage |
 
 The summary is the only thing printed to standard output. Everything else goes to standard error with a `DEBUG:` prefix, so callers can discard it with `2>/dev/null`.
@@ -177,6 +177,8 @@ The summary is the only thing printed to standard output. Everything else goes t
 4. **Guided output.** Summaries are generated into a Swift struct (`@Generable`), which keeps the model from adding chatty openers like "Sure! Here is a summary" or markdown titles.
 5. **Sensitive documents.** If the default safety filter declines (common with tax returns and other documents full of account numbers), the tool retries with Apple's permissive content-transformation mode, which is meant for summarizing text you already have. That mode only produces plain text, so the tool strips any preamble or formatting, and it prefixes the result with `Potentially sensitive:`.
 6. **Writing back.** For image-only scans, the tool writes a new PDF with the original page images plus an invisible text layer placed over the recognized words, and stores the summary in the PDF's **Subject** field. The new copy must open and have the same page count and real text, or the original is left untouched. It then replaces the original, keeping its creation date, Finder tags, and permissions. PDFs that already have text are never modified unless `--always-add-summary` is given.
+
+**Black-and-white cleanup.** When an image-only scan is rewritten, each page that is mostly black and white (under 1.5% colored pixels and under 25% mid-gray, so photos and color pages are skipped) is converted to grayscale with the paper brightened to white and the ink darkened. This is on by default; use `--no-cleanup`, or set `cleanUpBlackAndWhite` to `false` in the source, to leave page images untouched. PDFs that already have text are never cleaned up, since they aren't rewritten. `--dry-run` reports how many pages would be cleaned.
 
 The text layer lets Spotlight, Preview's search, and text selection work on scans. The Subject field is visible in Preview under **Tools → Show Inspector**, and Spotlight indexes it.
 

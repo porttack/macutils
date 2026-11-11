@@ -9,10 +9,11 @@
 // Rebuild after major macOS or Xcode updates.
 //
 // Requires: Apple silicon Mac, macOS 26+, Apple Intelligence on, Xcode or Command Line Tools.
-// Usage:  summarize-pdf [--dry-run] [--always-add-summary] file.pdf
+// Usage:  summarize-pdf [--dry-run] [--always-add-summary] [--no-cleanup] file.pdf
 //   -n, --dry-run             do the OCR and summary, report what would change, write nothing
 //   -s, --always-add-summary  also store the summary in PDFs that already have text
 //                             (this rewrites the file, so its modification date changes)
+//   -C, --no-cleanup          don't clean up black-and-white pages (see below)
 //
 // Image-only scans (no text layer) are OCR'd on-device with the Vision framework first.
 // The OCR text is written back into the PDF as an invisible, searchable text layer
@@ -22,6 +23,10 @@
 // --always-add-summary is given. Page images are unchanged, the creation date is kept, and
 // the original is only replaced after the new PDF passes a sanity check.
 // Set addTextLayer to false to never add text layers.
+// When an image-only scan is rewritten, each page that is mostly black and white (almost no
+// color, mostly light paper and dark ink) is also cleaned up: converted to grayscale, with the
+// paper brightened to white and the ink darkened. Color pages and photos are left as they are.
+// Pass --no-cleanup (or set cleanUpBlackAndWhite to false) to keep the page images untouched.
 // Exit codes: 0 = success, 1 = no text in PDF even after OCR, 2 = model error or still too long,
 //             3 = model declined even with permissive guardrails,
 //             4 = language not recognized (e.g., numbers-only receipt),
@@ -45,6 +50,10 @@ let fallbackCharLimits = [6000, 3000]   // tried in order if the word budget is 
 let addTextLayer = true                 // write OCR text back into image-only PDFs (OCRs every page)
 let maxOCRPagesForSummary = 5           // the summary only uses the opening pages anyway
 let minTextLayerCharacters = 20         // less than this counts as "no text layer"
+let cleanUpBlackAndWhite = true         // clean up mostly black-and-white pages (--no-cleanup turns it off)
+let maxColorFraction = 0.015            // a page is "black and white" if under 1.5% of pixels have color
+let maxMidtoneFraction = 0.25           // ...and under 25% are mid-gray (more than that looks like a photo)
+let cleanupLongSide = 3300.0            // render cleaned pages up to this many pixels on the long side
 
 let baseInstructions =
     "You summarize scanned personal documents such as bills, letters, forms, tax documents, and receipts."
@@ -144,8 +153,93 @@ func drawInvisibleText(_ lines: [OCRLine], in ctx: CGContext, pageSize: CGSize) 
     ctx.restoreGState()
 }
 
+// ===== Black-and-white cleanup =====
+
+// Render a page into a bitmap context of the given pixel width (gray or RGB), on white.
+func renderPage(_ page: PDFPage, pixelWidth: Int, gray: Bool) -> CGContext? {
+    let size = displaySize(of: page)
+    guard size.width > 0, size.height > 0 else { return nil }
+    let width = max(pixelWidth, 1)
+    let height = max(Int((CGFloat(width) * size.height / size.width).rounded()), 1)
+    let space = gray ? CGColorSpaceCreateDeviceGray() : CGColorSpaceCreateDeviceRGB()
+    let info = gray ? CGImageAlphaInfo.none.rawValue : CGImageAlphaInfo.noneSkipLast.rawValue
+    guard let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                              bytesPerRow: 0, space: space, bitmapInfo: info) else { return nil }
+    ctx.setFillColor(gray: 1, alpha: 1)
+    ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    ctx.interpolationQuality = .high
+    ctx.scaleBy(x: CGFloat(width) / size.width, y: CGFloat(height) / size.height)
+    page.transform(ctx, for: .mediaBox)
+    page.draw(with: .mediaBox, to: ctx)
+    return ctx
+}
+
+// Pixel width that keeps the long side at or under cleanupLongSide, and at least ~216 dpi.
+func cleanupPixelWidth(for page: PDFPage) -> Int {
+    let size = displaySize(of: page)
+    let scale = min(cleanupLongSide / max(size.width, size.height), 4.0)
+    return Int(size.width * max(scale, 3.0))
+}
+
+// True if the page is mostly black and white: almost no colored pixels, and mostly light
+// paper and dark ink rather than mid-tones (which would be a photo).
+func isMostlyBlackAndWhite(_ page: PDFPage) -> Bool {
+    guard let ctx = renderPage(page, pixelWidth: 500, gray: false), let data = ctx.data else { return false }
+    let pixels = data.bindMemory(to: UInt8.self, capacity: ctx.bytesPerRow * ctx.height)
+    var colored = 0, midtone = 0
+    for y in 0..<ctx.height {
+        for x in 0..<ctx.width {
+            let p = y * ctx.bytesPerRow + x * 4
+            let r = Int(pixels[p]), g = Int(pixels[p + 1]), b = Int(pixels[p + 2])
+            if max(r, g, b) - min(r, g, b) > 30 { colored += 1 }
+            let luma = (r * 3 + g * 6 + b) / 10
+            if luma > 76 && luma < 178 { midtone += 1 }
+        }
+    }
+    let total = Double(ctx.width * ctx.height)
+    return Double(colored) / total < maxColorFraction && Double(midtone) / total < maxMidtoneFraction
+}
+
+// Grayscale version of the page with levels adjusted: the paper (found from the brightness
+// histogram) becomes white and the darkest ink becomes black.
+func cleanedImage(of page: PDFPage) -> CGImage? {
+    guard let ctx = renderPage(page, pixelWidth: cleanupPixelWidth(for: page), gray: true),
+          let data = ctx.data else { return nil }
+    let count = ctx.bytesPerRow * ctx.height
+    let pixels = data.bindMemory(to: UInt8.self, capacity: count)
+
+    var histogram = [Int](repeating: 0, count: 256)
+    for y in 0..<ctx.height {
+        for x in 0..<ctx.width { histogram[Int(pixels[y * ctx.bytesPerRow + x])] += 1 }
+    }
+    let total = ctx.width * ctx.height
+    func percentile(_ fraction: Double) -> Int {
+        var running = 0
+        for value in 0..<256 {
+            running += histogram[value]
+            if Double(running) >= Double(total) * fraction { return value }
+        }
+        return 255
+    }
+    let black = Double(percentile(0.005))
+    let white = max(Double(percentile(0.70)) * 0.96, black + 80)   // a little below paper, so paper clips to pure white
+    var lookup = [UInt8](repeating: 0, count: 256)
+    for value in 0..<256 {
+        let level = min(max((Double(value) - black) / (white - black), 0), 1)
+        lookup[value] = UInt8((level * 255).rounded())
+    }
+    for y in 0..<ctx.height {
+        for x in 0..<ctx.width {
+            let p = y * ctx.bytesPerRow + x
+            pixels[p] = lookup[Int(pixels[p])]
+        }
+    }
+    return ctx.makeImage()
+}
+
 // Write a copy of the PDF with the original page images plus the invisible text layer.
-func writeSearchablePDF(_ doc: PDFDocument, ocrPages: [[OCRLine]], subject newSubject: String?, to url: URL) -> Bool {
+func writeSearchablePDF(_ doc: PDFDocument, ocrPages: [[OCRLine]], subject newSubject: String?,
+                        cleanUp: Bool, to url: URL) -> Bool {
     var info: [String: Any] = [kCGPDFContextCreator as String: "summarize-pdf (Vision OCR)"]
     let attributes = doc.documentAttributes ?? [:]
     if let title = attributes[PDFDocumentAttribute.titleAttribute] { info[kCGPDFContextTitle as String] = title }
@@ -161,10 +255,15 @@ func writeSearchablePDF(_ doc: PDFDocument, ocrPages: [[OCRLine]], subject newSu
         let boxData = Data(bytes: &mediaBox, count: MemoryLayout<CGRect>.size) as CFData
         ctx.beginPDFPage([kCGPDFContextMediaBox as String: boxData] as CFDictionary)
 
-        ctx.saveGState()
-        page.transform(ctx, for: .mediaBox)   // applies the page's rotation
-        page.draw(with: .mediaBox, to: ctx)
-        ctx.restoreGState()
+        if cleanUp, isMostlyBlackAndWhite(page), let image = cleanedImage(of: page) {
+            ctx.draw(image, in: mediaBox)
+            log("cleaned up black-and-white page \(index + 1)")
+        } else {
+            ctx.saveGState()
+            page.transform(ctx, for: .mediaBox)   // applies the page's rotation
+            page.draw(with: .mediaBox, to: ctx)
+            ctx.restoreGState()
+        }
 
         if index < ocrPages.count {
             drawInvisibleText(ocrPages[index], in: ctx, pageSize: size)
@@ -177,7 +276,7 @@ func writeSearchablePDF(_ doc: PDFDocument, ocrPages: [[OCRLine]], subject newSu
 
 // Rewrite the PDF safely: build the new copy beside the original, check it, then swap it in.
 // ocrPages != nil adds the invisible text layer; subject != nil stores the summary.
-func rewritePDF(_ fileURL: URL, doc: PDFDocument, ocrPages: [[OCRLine]]?, subject: String?) {
+func rewritePDF(_ fileURL: URL, doc: PDFDocument, ocrPages: [[OCRLine]]?, subject: String?, cleanUp: Bool) {
     let fm = FileManager.default
     do {
         let tempDir = try fm.url(for: .itemReplacementDirectory, in: .userDomainMask,
@@ -187,7 +286,7 @@ func rewritePDF(_ fileURL: URL, doc: PDFDocument, ocrPages: [[OCRLine]]?, subjec
 
         let written: Bool
         if let ocrPages {
-            written = writeSearchablePDF(doc, ocrPages: ocrPages, subject: subject, to: tempURL)
+            written = writeSearchablePDF(doc, ocrPages: ocrPages, subject: subject, cleanUp: cleanUp, to: tempURL)
         } else {
             var attributes = doc.documentAttributes ?? [:]
             attributes[PDFDocumentAttribute.subjectAttribute] = subject
@@ -294,20 +393,23 @@ func summarizeWithFallback(_ text: String) async throws -> String {
 
 func printUsage() {
     FileHandle.standardError.write(Data("""
-        usage: summarize-pdf [--dry-run] [--always-add-summary] file.pdf
+        usage: summarize-pdf [--dry-run] [--always-add-summary] [--no-cleanup] file.pdf
           -n, --dry-run             do the OCR and summary, report what would change, write nothing
           -s, --always-add-summary  also store the summary in PDFs that already have text
+          -C, --no-cleanup          don't clean up black-and-white pages
 
         """.utf8))
 }
 
 var dryRun = false
 var alwaysAddSummary = false
+var cleanUpEnabled = cleanUpBlackAndWhite
 var paths: [String] = []
 for argument in CommandLine.arguments.dropFirst() {
     switch argument {
     case "-n", "--dry-run": dryRun = true
     case "-s", "--always-add-summary": alwaysAddSummary = true
+    case "-C", "--no-cleanup": cleanUpEnabled = false
     case "-h", "--help": printUsage(); exit(0)
     default:
         if argument.hasPrefix("-") {
@@ -404,10 +506,14 @@ if textLayerPages != nil || subjectToStore != nil {
     if dryRun {
         var changes: [String] = []
         if let pages = textLayerPages { changes.append("add a searchable text layer to \(pages.count) pages") }
+        if textLayerPages != nil, cleanUpEnabled {
+            let bw = (0..<doc.pageCount).filter { doc.page(at: $0).map(isMostlyBlackAndWhite) ?? false }.count
+            if bw > 0 { changes.append("clean up \(bw) black-and-white page\(bw == 1 ? "" : "s")") }
+        }
         if subjectToStore != nil { changes.append("store the summary in the Subject field") }
         log("dry run: would " + changes.joined(separator: " and ") + " (creation date kept)")
     } else {
-        rewritePDF(fileURL, doc: doc, ocrPages: textLayerPages, subject: subjectToStore)
+        rewritePDF(fileURL, doc: doc, ocrPages: textLayerPages, subject: subjectToStore, cleanUp: cleanUpEnabled)
     }
 } else {
     log(dryRun ? "dry run: would leave the PDF unchanged" : "PDF left unchanged")
