@@ -26,6 +26,10 @@
 // When an image-only scan is rewritten, each page that is mostly black and white (almost no
 // color, mostly light paper and dark ink) is also cleaned up: converted to grayscale, with the
 // paper brightened to white and the ink darkened. Color pages and photos are left as they are.
+// Color pages get a lighter touch: if a flat light color (beige card stock, cream or gray paper)
+// covers a good share of the page, it is leveled to white. Photos and real colors are untouched.
+// A PDF that already has a text layer is cleaned too, but only if some page has off-white paper;
+// then its pages are re-OCR'd and rewritten, and the new text layer replaces the old one.
 // Pass --no-cleanup (or set cleanUpBlackAndWhite to false) to keep the page images untouched.
 // Exit codes: 0 = success, 1 = no text in PDF even after OCR, 2 = model error or still too long,
 //             3 = model declined even with permissive guardrails,
@@ -53,6 +57,8 @@ let minTextLayerCharacters = 20         // less than this counts as "no text lay
 let cleanUpBlackAndWhite = true         // clean up mostly black-and-white pages (--no-cleanup turns it off)
 let maxColorFraction = 0.015            // a page is "black and white" if under 1.5% of pixels have color
 let maxMidtoneFraction = 0.25           // ...and under 25% are mid-gray (more than that looks like a photo)
+let minPaperFraction = 0.03             // a flat light color covering this much of a color page counts as paper
+let maxPaperColors = 4                  // ...and at most this many paper colors are whitened per page
 let cleanupLongSide = 3300.0            // render cleaned pages up to this many pixels on the long side
 
 let baseInstructions =
@@ -237,6 +243,134 @@ func cleanedImage(of page: PDFPage) -> CGImage? {
     return ctx.makeImage()
 }
 
+// ===== Whitening paper on color pages =====
+
+// Flat, light, low-saturation colors that cover a good share of the page (beige card stock,
+// gray or cream paper). Photos spread their colors out, so they rarely have such a peak.
+// Colors that are already white are skipped.
+func findPaperColors(_ page: PDFPage) -> [(r: Double, g: Double, b: Double)] {
+    guard let ctx = renderPage(page, pixelWidth: 500, gray: false), let data = ctx.data else { return [] }
+    let pixels = data.bindMemory(to: UInt8.self, capacity: ctx.bytesPerRow * ctx.height)
+    let total = Double(ctx.width * ctx.height)
+
+    // 16 levels per channel; remember each pixel's bin so peaks can be summed with their neighbors
+    var counts = [Int](repeating: 0, count: 16 * 16 * 16)
+    for y in 0..<ctx.height {
+        for x in 0..<ctx.width {
+            let p = y * ctx.bytesPerRow + x * 4
+            counts[(Int(pixels[p]) >> 4) * 256 + (Int(pixels[p + 1]) >> 4) * 16 + (Int(pixels[p + 2]) >> 4)] += 1
+        }
+    }
+    func neighborhood(_ r: Int, _ g: Int, _ b: Int) -> Int {
+        var sum = 0
+        for dr in -1...1 { for dg in -1...1 { for db in -1...1 {
+            let (rr, gg, bb) = (r + dr, g + dg, b + db)
+            if (0..<16).contains(rr), (0..<16).contains(gg), (0..<16).contains(bb) { sum += counts[rr * 256 + gg * 16 + bb] }
+        } } }
+        return sum
+    }
+
+    var found: [(r: Double, g: Double, b: Double)] = []
+    var taken = Set<Int>()
+    let candidates = counts.indices.sorted { counts[$0] > counts[$1] }.prefix(40)
+    for index in candidates where found.count < maxPaperColors {
+        let (r, g, b) = (index / 256, (index / 16) % 16, index % 16)
+        let center = (r * 16 + 8, g * 16 + 8, b * 16 + 8)
+        let chroma = max(center.0, center.1, center.2) - min(center.0, center.1, center.2)
+        // light enough to be paper, and not saturated enough to be a real color
+        guard min(center.0, center.1, center.2) >= 150, chroma <= 80,
+              Double(neighborhood(r, g, b)) / total >= minPaperFraction else { continue }
+        // skip bins next to a paper color we already have
+        if taken.contains(where: { abs($0 / 256 - r) <= 1 && abs(($0 / 16) % 16 - g) <= 1 && abs($0 % 16 - b) <= 1 }) { continue }
+        taken.insert(index)
+        // average the actual pixels near this bin for a precise paper color
+        var sums = (0.0, 0.0, 0.0), n = 0.0
+        for y in 0..<ctx.height {
+            for x in 0..<ctx.width {
+                let p = y * ctx.bytesPerRow + x * 4
+                let (pr, pg, pb) = (Int(pixels[p]), Int(pixels[p + 1]), Int(pixels[p + 2]))
+                if abs(pr - center.0) <= 24, abs(pg - center.1) <= 24, abs(pb - center.2) <= 24 {
+                    sums.0 += Double(pr); sums.1 += Double(pg); sums.2 += Double(pb); n += 1
+                }
+            }
+        }
+        guard n > 0 else { continue }
+        let paper = (r: sums.0 / n, g: sums.1 / n, b: sums.2 / n)
+        if min(paper.r, paper.g, paper.b) >= 248 { continue }   // already white
+        found.append(paper)
+    }
+    return found
+}
+
+func smoothstep(_ x: Double, _ lo: Double, _ hi: Double) -> Double {
+    let t = min(max((x - lo) / (hi - lo), 0), 1)
+    return t * t * (3 - 2 * t)
+}
+
+// Color version of the page with each paper color leveled to white. A pixel is "paper" if each
+// channel is the same fraction of the paper color's channel (same hue, maybe shaded), so the
+// anti-aliased edges of dark text on beige come out clean instead of with a tan halo. Anything
+// with a different hue (logos, photos, colored ink) is left exactly as scanned.
+func whitenedImage(of page: PDFPage, papers: [(r: Double, g: Double, b: Double)]) -> CGImage? {
+    guard !papers.isEmpty,
+          let ctx = renderPage(page, pixelWidth: cleanupPixelWidth(for: page), gray: false),
+          let data = ctx.data else { return nil }
+    let pixels = data.bindMemory(to: UInt8.self, capacity: ctx.bytesPerRow * ctx.height)
+    var anyColor = false
+    for y in 0..<ctx.height {
+        for x in 0..<ctx.width {
+            let p = y * ctx.bytesPerRow + x * 4
+            let channels = [Double(pixels[p]), Double(pixels[p + 1]), Double(pixels[p + 2])]
+            defer {
+                if !anyColor, Int(max(pixels[p], pixels[p + 1], pixels[p + 2])) - Int(min(pixels[p], pixels[p + 1], pixels[p + 2])) > 30 { anyColor = true }
+            }
+            var best = 0.0
+            var target = channels
+            for paper in papers {
+                let q = [channels[0] / paper.r, channels[1] / paper.g, channels[2] / paper.b]
+                let spread = (q.max() ?? 0) - (q.min() ?? 0)
+                let weight = 1 - smoothstep(spread, 0.07, 0.20)
+                if weight > best {
+                    best = weight
+                    target = q.map { min($0, 1) * 255 }
+                }
+            }
+            guard best > 0 else { continue }
+            for c in 0..<3 {
+                pixels[p + c] = UInt8(min(max((channels[c] + (target[c] - channels[c]) * best).rounded(), 0), 255))
+            }
+        }
+    }
+    guard let image = ctx.makeImage() else { return nil }
+    if anyColor { return image }
+    // Nothing but paper and gray ink was left (the "color" was only the paper), so store it as gray: much smaller
+    guard let gray = CGContext(data: nil, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: 0,
+                               space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return image }
+    gray.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+    return gray.makeImage() ?? image
+}
+
+// True if the page's paper is visibly off-white, so cleaning it would actually change something.
+// Used for PDFs that already have text, so clean ones aren't rewritten (or rasterized) for nothing.
+func paperNeedsWhitening(_ page: PDFPage) -> Bool {
+    if isMostlyBlackAndWhite(page) {
+        guard let ctx = renderPage(page, pixelWidth: 500, gray: true), let data = ctx.data else { return false }
+        let pixels = data.bindMemory(to: UInt8.self, capacity: ctx.bytesPerRow * ctx.height)
+        var histogram = [Int](repeating: 0, count: 256)
+        for y in 0..<ctx.height { for x in 0..<ctx.width { histogram[Int(pixels[y * ctx.bytesPerRow + x])] += 1 } }
+        var running = 0
+        for value in 0..<256 {
+            running += histogram[value]
+            if Double(running) >= Double(ctx.width * ctx.height) * 0.70 { return value < 248 }
+        }
+        return false
+    }
+    return !findPaperColors(page).isEmpty
+}
+
+// When true (PDFs that already have text), only pages with off-white paper are cleaned.
+var cleanOnlyWhenNeeded = false
+
 // Write a copy of the PDF with the original page images plus the invisible text layer.
 func writeSearchablePDF(_ doc: PDFDocument, ocrPages: [[OCRLine]], subject newSubject: String?,
                         cleanUp: Bool, to url: URL) -> Bool {
@@ -255,9 +389,14 @@ func writeSearchablePDF(_ doc: PDFDocument, ocrPages: [[OCRLine]], subject newSu
         let boxData = Data(bytes: &mediaBox, count: MemoryLayout<CGRect>.size) as CFData
         ctx.beginPDFPage([kCGPDFContextMediaBox as String: boxData] as CFDictionary)
 
-        if cleanUp, isMostlyBlackAndWhite(page), let image = cleanedImage(of: page) {
+        let wanted = cleanUp && (!cleanOnlyWhenNeeded || paperNeedsWhitening(page))
+        if wanted, isMostlyBlackAndWhite(page), let image = cleanedImage(of: page) {
             ctx.draw(image, in: mediaBox)
             log("cleaned up black-and-white page \(index + 1)")
+        } else if wanted, case let papers = findPaperColors(page), !papers.isEmpty,
+                  let image = whitenedImage(of: page, papers: papers) {
+            ctx.draw(image, in: mediaBox)
+            log("whitened \(papers.count) paper color\(papers.count == 1 ? "" : "s") on color page \(index + 1)")
         } else {
             ctx.saveGState()
             page.transform(ctx, for: .mediaBox)   // applies the page's rotation
@@ -438,10 +577,15 @@ guard let doc = PDFDocument(url: fileURL) else {
 
 var fullText = doc.string ?? ""
 var ocrPages: [[OCRLine]]? = nil
-if fullText.trimmingCharacters(in: .whitespacesAndNewlines).count < minTextLayerCharacters {
+let hasTextLayer = fullText.trimmingCharacters(in: .whitespacesAndNewlines).count >= minTextLayerCharacters
+// A PDF that already has text is rewritten only if some page has off-white paper to clean
+cleanOnlyWhenNeeded = hasTextLayer
+let textPDFNeedsCleanup = hasTextLayer && cleanUpEnabled &&
+    (0..<doc.pageCount).contains { doc.page(at: $0).map(paperNeedsWhitening) ?? false }
+if !hasTextLayer || textPDFNeedsCleanup {
     // OCR every page when adding a text layer; otherwise only what the summary needs
     let pagesToOCR = addTextLayer ? doc.pageCount : min(doc.pageCount, maxOCRPagesForSummary)
-    log("no text layer; running OCR on \(pagesToOCR) of \(doc.pageCount) pages")
+    log((hasTextLayer ? "off-white paper found; re-running OCR to rebuild the text layer" : "no text layer") + "; running OCR on \(pagesToOCR) of \(doc.pageCount) pages")
 
     var pages: [[OCRLine]] = []
     for index in 0..<pagesToOCR {
@@ -451,9 +595,11 @@ if fullText.trimmingCharacters(in: .whitespacesAndNewlines).count < minTextLayer
     ocrPages = pages
 
     // Summary text comes from the opening pages only
-    fullText = pages.prefix(maxOCRPagesForSummary)
-        .map { $0.map(\.text).joined(separator: "\n") }
-        .joined(separator: "\n\n")
+    if !hasTextLayer {
+        fullText = pages.prefix(maxOCRPagesForSummary)
+            .map { $0.map(\.text).joined(separator: "\n") }
+            .joined(separator: "\n\n")
+    }
 }
 guard !fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
     log("no text found, even after OCR")
@@ -509,6 +655,11 @@ if textLayerPages != nil || subjectToStore != nil {
         if textLayerPages != nil, cleanUpEnabled {
             let bw = (0..<doc.pageCount).filter { doc.page(at: $0).map(isMostlyBlackAndWhite) ?? false }.count
             if bw > 0 { changes.append("clean up \(bw) black-and-white page\(bw == 1 ? "" : "s")") }
+            let whiten = (0..<doc.pageCount).filter {
+                guard let page = doc.page(at: $0), !isMostlyBlackAndWhite(page) else { return false }
+                return !findPaperColors(page).isEmpty
+            }.count
+            if whiten > 0 { changes.append("whiten the paper on \(whiten) color page\(whiten == 1 ? "" : "s")") }
         }
         if subjectToStore != nil { changes.append("store the summary in the Subject field") }
         log("dry run: would " + changes.joined(separator: " and ") + " (creation date kept)")
